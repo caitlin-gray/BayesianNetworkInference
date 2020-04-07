@@ -7,6 +7,7 @@ from joblib import Parallel, delayed
 import math
 import itertools
 import time
+from sklearn.metrics import precision_recall_curve as pr_curve
 def Initialise_graph(cascade_V_vec, cascade_t,n):
     G = nx.Graph() # initialise neihbourhood dict
 
@@ -50,8 +51,8 @@ def Initialise_graph(cascade_V_vec, cascade_t,n):
     del G
     return G_adj,diag_vec_l, number_of_edges
 
-def networkinferenceMCMC(n,cascade_V_vec, cascade_t, p, beta, number_of_iterations, record_step=0, burn_in=0, seed=0):
-
+def networkinferenceMCMC_TNT2(n,cascade_V_vec, cascade_t, p, beta, number_of_iterations, record_step=0, burn_in=0, seed=0):
+    # alternative TNT method to reduce memory requirements
     if p == 1 or beta==1 or beta ==0:
         raise ValueError("p and beta must be (0,1)")
 
@@ -193,6 +194,131 @@ def networkinferenceMCMC(n,cascade_V_vec, cascade_t, p, beta, number_of_iteratio
         return save
     else:
         return G_adj
+def networkinferenceMCMC_TNT(n,cascade_V_vec, cascade_t, p, beta, number_of_iterations, record_step=0, burn_in=0, seed=0):
+    # higher memory original tnt
+    if p == 1 or beta==1 or beta ==0:
+        raise ValueError("p and beta must be (0,1)")
+
+
+    beta_l = math.log(1-beta)
+    graph_ratio_rem = math.log(1 - p) - math.log(p)
+    graph_ratio_add = math.log(p) - math.log(1 - p)
+
+
+    if seed !=0:
+        rand.seed(seed)     # set seed
+
+    if record_step:         # if recording
+        save =[]
+
+
+    tot_edges = int(n*(n-1)/2)
+
+    # get initial graph and probabilties
+    G_adj, diag_vec_l,number_of_edges = Initialise_graph(cascade_V_vec, cascade_t,n)
+
+    # preallocate memory for edge list (good for sparse graphs, if dense just use adjacency)
+    edge_list = np.zeros([tot_edges,2],dtype=int)
+
+    # fill edge list
+    k=0
+    for pair in iter((n,nbr) for n, nbrs in G_adj.items() for nbr, ddict in nbrs.items()):
+        if pair[0]<pair[1]:
+            edge_list[k] = pair
+            k+=1
+
+    for i in range(n):
+        for j in range(i+1, n):
+            if not (i in G_adj.keys() and j in G_adj[i].keys() ):
+                edge_list[k] = [i,j]
+                k+=1
+
+    t=time.time()
+    for it in range(number_of_iterations):
+        # propose a move step to get G'
+
+        # for TNT sampler choose links or not
+        if rand.random()<0.5:
+            rand_ind = int(math.floor(rand.random() * number_of_edges))
+            [i,j] = edge_list[rand_ind]
+            had_edge = 1
+            Q_l = math.log(tot_edges-number_of_edges + 1) -math.log(number_of_edges)
+            graph_ratio_l = graph_ratio_rem
+        else:
+            rand_ind = number_of_edges + int(math.floor(rand.random() * (tot_edges-number_of_edges)))
+            [i,j] = edge_list[rand_ind]
+            had_edge = 0
+            graph_ratio_l = graph_ratio_add
+            Q_l = math.log(number_of_edges+1) - math.log(tot_edges-number_of_edges)
+
+        new_j_l = np.zeros([len(cascade_V_vec), 3])
+        diag_l_tmp = 0
+        beta_exponent = 0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            for ec, cascade_V in enumerate(cascade_V_vec):
+                timei = cascade_t[ec][i]
+                timej = cascade_t[ec][j]
+
+                if timei > timej:                # make i  always infect j
+                    i, j = j, i
+                    timei, timej = timej, timei
+                if timej < np.Inf:              #j in cascade_V:
+                    new_j_l[ec,0] = ec
+                    new_j_l[ec,1] = j
+                    detadding = diag_vec_l[ec][j]
+                    diag_l_tmp += detadding
+
+                    new_j_l[ec,2] = detadding + np.log(1 + ((-1) ** had_edge) * math.exp(-(timej - timei)-detadding))   # logaddexp
+
+                    if not new_j_l[ec,2] < np.Inf: #INFINITY if NAN then this will be False
+                        new_j_l[ec,2] = -np.Inf #INFINITY
+
+                if timei<np.Inf:#i in cascade_V:
+                    beta_exponent += ((-1) ** had_edge)  # r changes if i or j in cascade
+
+
+        alpha_l = sum(new_j_l[:,2]) - diag_l_tmp + graph_ratio_l + beta_exponent * beta_l + Q_l
+
+
+        if math.log(rand.random()) < alpha_l:  # accept with prob alpha and go to the new graph
+            for each in new_j_l:
+                if not (each[2] ==0 and each[1]==0 and each[0]==0):
+                  diag_vec_l[int(each[0])][int(each[1])] = each[2]
+
+            if had_edge == 0:
+                edge_list[rand_ind] = edge_list[number_of_edges]
+                edge_list[number_of_edges]  = [i,j]         #add this edge to the edge_list
+                number_of_edges+=1          # add one to the number of edges
+                try:
+                    G_adj[i][j] = {}
+                except KeyError:
+                    G_adj[i] = {}
+                    G_adj[i][j] = {}
+                try:
+                    G_adj[j][i] = {}
+                except KeyError:
+                    G_adj[j] = {}
+                    G_adj[j][i] = {}
+            else:
+                del G_adj[i][j]
+                del G_adj[j][i]
+                edge_list[rand_ind] = edge_list[number_of_edges-1]        # put the last value in to the 'empty spot'
+                edge_list[number_of_edges-1] = [i,j]                      # make the last one empty
+                number_of_edges-=1
+
+        if record_step:
+            if it%record_step==0:
+                if burn_in and (it>n**2):
+                    save.append([(i,j) for i in G_adj.keys() for j in G_adj[i]])
+                else:
+                    save.append([(i,j) for i in G_adj.keys() for j in G_adj[i]])
+
+    print(time.time()-t)
+    if record_step:
+        return save
+    else:
+        return G_adj
+
 
 def IndependentCascade_edges(G, I, beta,edges={}):
     W = I
@@ -302,7 +428,7 @@ cascade_V_vec,cascade_t = SimulateCascades(RG, beta, fraction=0.99)
 number_of_iterations = n**2 * 100
 num_cores = multiprocessing.cpu_count()-1
 sample_size=100
-samples = Parallel(n_jobs=num_cores)(delayed(networkinferenceMCMC)(n,cascade_V_vec, cascade_t, p, beta, number_of_iterations, seed=rep) for rep in range(sample_size))
+samples = Parallel(n_jobs=num_cores)(delayed(networkinferenceMCMC_TNT)(n,cascade_V_vec, cascade_t, p, beta, number_of_iterations, seed=rep) for rep in range(sample_size))
 
 save = [[(i,j) for i in G_adj.keys() for j in G_adj[i]] for G_adj in samples]
 
@@ -315,7 +441,7 @@ def ROC(score, y,number_of_points=100):
     # min_score = min(score)
     # max_score = max(score)
     # thr = np.linspace(min_score, max_score, 30)
-    thr = np.linspace(1.000001, 0, number_of_points)  ## need a bit more than 1
+    thr = np.linspace(1+1/number_of_points 0, number_of_points) 
     FP = 0
     TP = 0
     P = sum(y)
